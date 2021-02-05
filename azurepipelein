@@ -1,0 +1,137 @@
+Recently I’ve been spending a bit of time working with a few customers, onboarding them to Azure Kubernetes Service. This is generally a pretty straight forward process; Build Cluster, Configure ACR, Setup CI/CD.
+
+During the CI/CD buildout with one customer, we noticed pretty quickly that our cheap and easy basic ACR was filling up rather quickly. Mostly with development containers which were used once or twice and then never again.
+
+
+Not yet 50% full in less than a month.
+In my opinion the build rate of this repository wasn’t too bad. We pushed to development and testing 48 times over a one week period, with these incremental changes flowing through to production pretty reliably on our weekly schedule.
+
+
+This being said, the growth trajectory put our development ACR filling up in about 3-4 months. Sure we could simply upgrade the ACR to a standard or premium tier, but at what cost? A 4x price increase between basic and standard SKU’s, and even steeper 9x to premium. Thankfully, we can solve for this in few ways.
+
+Manage our container size – Start from scratch or a container specific OS like alpine.
+Build containers less frequently – We have almost a 50:1 development to production ratio, so there is definitely a bit of wiggle room there.
+Manage the registry contents, deleting old or untagged images.
+Combining these options will provides our team with a long term and scalable solution. The third option is the most complex item, and the subject for the remainder of this post.
+
+ACR Purge and Automatic Cleanup
+As a preview feature, Azure Container Registry now supports filter based cleanup of images and containers. This can be completed as an ad-hoc process or as a scheduled task. To get things right, I’ll first build an ACR command that deletes tagged images.
+
+# Environment variable for container command line
+PURGE_CMD="acr purge \
+  --filter 'container/myimage:dev-.*' \
+  --ago 3d --dry-run"
+az acr run \
+  --cmd "$PURGE_CMD" \
+  --registry mycontainerregistry \
+  /dev/null
+I’ve set an agreed upon container age for my containers and I’m quite selective of which containers I purge. The above dry-run only selects the development “myimage” container and gives me a nice example of what my task would actually do.
+
+
+Including multiple filters in purge commands is supported. So, feel free to build expansive query sets. Once you are happy with the dry run output, it’s time to setup an automatic job. ACR uses standard cronjob syntax for scheduling, so this should be a pretty familiar experience for linux administrators.
+
+PURGE_CMD="acr purge \
+  --filter 'container/my-api:dev-.*' \
+  --filter 'container/my-db:dev-.*' \
+  --ago 3d"
+az acr task create --name old-container-purge \
+  --cmd "$PURGE_CMD" \
+  --schedule "0 2 * * *" \
+  --registry mycontainerregistry \
+  --timeout 3600 \
+  --context /dev/null
+And just like that, we have a task which will clean up our registry daily at 2am.
+
+
+As an ARM Template please?
+If you’re operating or deploying multiple container registries for various teams, you might want to standardise this type of task across the board. As such, integrating this into your ARM templates would be mighty useful.
+
+Microsoft provides the “Microsoft.ContainerRegistry/registries/tasks” resource type for deploying these actions at scale. There is, however, a slightly irritating quirk. Your ACR command must be base64 encoded YAML following the tasks specification neatly documented here. I’m not sure about our readers, but generally combining Base64, YAML and JSON leaves a nasty taste in my mouth!
+
+{
+    "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+    "contentVersion": "1.0.0.0",
+    "parameters": {
+        "containerRegistryName": {
+            "type": "String",
+            "metadata": {
+                "description": "Name of the ACR to deploy task resource."
+            }
+        },
+        "containerRegistryTaskName" : {
+            "defaultValue": "old-container-purge",
+            "type": "String",
+            "metadata": {
+                "description": "Name for the ACR Task resource."
+            }
+        },
+        "taskContent" : {
+            "defaultValue": "dmVyc2lvbjogdjEuMS4wCnN0ZXBzOiAKICAtIGNtZDogYWNyIHB1cmdlIC0tZmlsdGVyICdjb250YWluZXIvbXktYXBpOmRldi0uKicgLS1maWx0ZXIgJ2NvbnRhaW5lci9teS1kYjpkZXYtLionIC0tYWdvIDNkIgogICAgZGlzYWJsZVdvcmtpbmdEaXJlY3RvcnlPdmVycmlkZTogdHJ1ZQogICAgdGltZW91dDogMzYwMA==",
+            "type": "String",
+            "metadata": {
+                "description": "Base64 Encoded YAML for the ACR Task."
+            }
+        },
+        "taskSchedule"  : {
+            "defaultValue": "0 2 * * *",
+            "type": "String",
+            "metadata": {
+                "description": "CRON Schedule for the ACR Task resource."
+            }
+        },
+        "location": {
+            "type": "string",
+            "defaultValue": "[resourceGroup().location]",
+            "metadata": {
+                "description": "Location to deploy the ACR Task resource."
+            }
+        }
+    },
+    "functions": [],
+    "variables": {},
+    "resources": [
+        {
+            "type": "Microsoft.ContainerRegistry/registries/tasks",
+            "name": "[concat(parameters('containerregistryName'), '/', parameters('containerRegistryTaskName'))]",
+            "apiVersion": "2019-06-01-preview",
+            "location": "[parameters('location')]",
+            "properties": {
+                "platform": {
+                    "os": "linux",
+                    "architecture": "amd64"
+                },
+                "agentConfiguration": {
+                    "cpu": 2
+                },
+                "timeout": 3600,
+                "step": {
+                    "type": "EncodedTask",
+                    "encodedTaskContent": "[parameters('taskContent')]",
+                    "values": []
+                },
+                "trigger": {
+                    "timerTriggers": [
+                        {
+                            "schedule": "[parameters('taskSchedule')]",
+                            "status": "Enabled",
+                            "name": "t1"
+                        }
+                    ],
+                    "baseImageTrigger": {
+                        "baseImageTriggerType": "Runtime",
+                        "status": "Enabled",
+                        "name": "defaultBaseimageTriggerName"
+                    }
+                }
+            }
+        }
+    ],
+    "outputs": {}
+}
+The above encoded base64 translates to the following YAML. Note that it includes the required command and some details about the execution timeout limit. For actions that purge a large amount of containers, Microsoft advises you might need to increase this limit beyond the default 3600 seconds (1 Hour).
+
+version: v1.1.0
+steps: 
+  - cmd: acr purge --filter 'container/my-api:dev-.*' --filter 'container/my-db:dev-.*' --ago 3d"
+    disableWorkingDirectoryOverride: true
+    timeout: 3600
